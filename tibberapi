@@ -1,0 +1,325 @@
+/* --------------- Global variables ---------------*/
+
+SS = SpreadsheetApp.getActiveSpreadsheet();
+CONFIG = SS.getSheets()[0];
+
+ACCESS_TOKEN = CONFIG.getRange("B2:B2").getValues();
+START_DATE = CONFIG.getRange("B4:B4").getValues();
+END_DATE = CONFIG.getRange("B5:B5").getValues();
+START_OBJ = new Date(START_DATE);
+END_OBJ = new Date(END_DATE);
+
+URL = "https://api.tibber.com/v1-beta/gql";
+HOME_INFO = fetchHomes();
+CONSUMPTION_DATA = fetchConsumption();
+NUMBER_OF_HOMES = CONSUMPTION_DATA.data.viewer.homes.length;
+
+/* -------------------- DATE fuckery --------------------*/
+
+// return beforeDate in base64
+function beforeDate() {
+  var GMT = "";
+
+  const offset = END_OBJ.getTimezoneOffset();
+  var beforeDate = new Date(END_OBJ.getTime() - offset * 60 * 1000);
+  if (offset == -120) GMT = "+02:00";
+  if (offset == -60) GMT = "+01:00";
+
+  var string = beforeDate.toISOString().split("T")[0] + "T00:00:00.000" + GMT;
+  return Utilities.base64Encode(string, Utilities.Charset.UTF_8);
+}
+
+// return total hours between START_DATE and END_DATE
+function getHours() {
+  var offset = (END_OBJ.getTimezoneOffset() > START_OBJ.getTimezoneOffset()) ? 1 : 0;
+  var hours = Math.abs(END_OBJ - START_OBJ) / 36e5 + offset;
+
+  return hours;
+}
+
+/* ----------------- POST data functions -----------------*/
+
+// return homeInfo JSON
+function fetchHomes() {
+  var query =
+    "\
+  {\
+    viewer {\
+      homes {\
+        meteringPointData {\
+          gridCompany\
+        }\
+        address {\
+            address1\
+            address1\
+            address1\
+            postalCode\
+            city\
+        }\
+      }\
+    }\
+  }";
+
+  settings = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ACCESS_TOKEN,
+    },
+    payload: JSON.stringify({ query }),
+  };
+
+  response = UrlFetchApp.fetch(URL, settings);
+
+  var data = JSON.parse(response.getContentText());
+
+  const homes = data.data.viewer.homes;
+
+  var values = homes.map((entry) => [
+    entry.address.address1,
+    entry.address.postalCode,
+    entry.address.city,
+    entry.meteringPointData.gridCompany,
+  ]);
+
+  if (data.data.viewer.homes.length == 0) {
+    console.log("No homes found");
+    return null;
+  } else return values;
+}
+
+// return consumption JSON
+function fetchConsumption() {
+  //var query = '{ viewer { homes { id }  } }';
+  var query =
+    '\
+  {\
+    viewer {\
+      homes {\
+        consumption(resolution: HOURLY, before:  " ' + beforeDate() + ' ", last: ' + getHours() + ") {\
+          nodes {\
+            from\
+            to\
+            cost\
+            unitPrice\
+            unitPriceVAT\
+            currency\
+            consumption\
+            consumptionUnit\
+          }\
+        }\
+      }\
+    }\
+  }";
+
+  settings = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + ACCESS_TOKEN,
+    },
+    payload: JSON.stringify({ query }),
+  };
+
+  response = UrlFetchApp.fetch(URL, settings);
+
+  var data = JSON.parse(response.getContentText());
+
+  if (data.data.viewer.homes.length == 0) {
+    console.log("No homes found");
+    return null;
+  } else return data;
+}
+
+/* -------------------- Sort functions --------------------*/
+
+// return [(0 - 1), (1 - 2), ... , (i)] kW band
+function effectBand(consumptionArray) {
+  var effects = [0];
+
+  loop1: for (var i = 0; i < consumptionArray.length; i++) {
+    var round = Math.round(consumptionArray[i] + 0.5);
+
+    loop2: for (var j = 0; j < 25; j++) {
+      if (round > effects.length) {
+        effects.push(0);
+      }
+      if (round <= effects.length) {
+        effects[round - 1]++;
+        break loop2;
+      }
+    }
+  }
+  return effects;
+}
+
+// return obj[year][month] = [consumption array]
+function createConsumptionJSON(homeIndex) {
+  var values = CONSUMPTION_DATA.data.viewer.homes[homeIndex].consumption.nodes;
+
+  var createNestedArray = function (base, time, value) {
+    let year = time[0];
+    let month = time[1];
+
+    if (year in base) {
+      if (month in base[year]) {
+        base[year][month].push(value);
+      } else {
+        base[year][month] = [value];
+      }
+    } else {
+      base[year] = {};
+      base[year][month] = [value];
+    }
+    return base;
+  };
+  var obj = {};
+
+  for (var i = 0; i < values.length; i++) {
+    var year = values[i].from.substring(0, 4);
+    var month = values[i].from.substring(5, 7);
+
+    createNestedArray(obj, [year, month], values[i].consumption);
+  }
+  return obj;
+}
+
+/* ------------------- Populate Sheets -------------------*/
+
+function clearSheets() {
+  var sheets = SS.getSheets();
+  for (i = 0; i < sheets.length; i++) {
+    switch (sheets[i].getSheetName()) {
+      case "Config":
+      case "DSO":
+        break;
+      default:
+        SS.deleteSheet(sheets[i]);
+    }
+  }
+}
+
+function buildSheets() {
+  HOME_INFO.forEach(function (row) {
+    var address = row[0];
+    var build = SpreadsheetApp.getActive().insertSheet();
+    build.setName(address);
+  });
+}
+
+function setHeaderConsumption() {
+  for (var i = 1; i <= NUMBER_OF_HOMES; i++) {
+    var sheet = SS.getSheets()[i];
+    var range = sheet.getRange("A1:J1");
+    var style = SpreadsheetApp.newTextStyle().setBold(true).build();
+    range.setTextStyle(style);
+    range.setValues([
+      [
+        "Fra",
+        "Til",
+        "Kostnad",
+        "Pris per kWh",
+        "MVA",
+        "Valuta",
+        "Forbruk",
+        "Enhet",
+        "",
+        "Nettleverandør:",
+      ],
+    ]);
+  }
+}
+
+function setHeaderEffect() {
+  for (var home = 1; home <= NUMBER_OF_HOMES; home++) {
+    var sheet = SS.getSheets()[home];
+    var bandLength = ((sheet.getLastColumn() - 11) > 0) ? sheet.getLastColumn() - 11 : 0;
+    var range = sheet.getRange(3, 9, 1, (bandLength + 3));
+
+    var bandStringArray = [];
+    bandStringArray.push("År");
+    bandStringArray.push("Måned");
+    bandStringArray.push("Forbruk [kWh]");
+    for(var i = 0; i < bandLength; i++) {
+      bandStringArray.push("[" + i + " - " + (i + 1) + "] kWh");
+    }
+
+    var style = SpreadsheetApp.newTextStyle().setBold(true).build();
+    var values = [bandStringArray];
+    range.setTextStyle(style);
+    range.setValues(values);
+  }
+}
+
+function setDsoInfo() {
+  var i = 1;
+  HOME_INFO.forEach(function (row) {
+    var DSO = row[3];
+    SS.getSheets()[i].getRange(1, 11).setValue(DSO);
+    i++;
+  });
+}
+
+function populateSheetsConsumption() {
+  for (var i = 1; i <= NUMBER_OF_HOMES; i++) {
+    var values = CONSUMPTION_DATA.data.viewer.homes[i - 1].consumption.nodes.map(
+      (entry) => [
+        entry.from,
+        entry.to,
+        entry.cost || 0,
+        entry.unitPrice,
+        entry.unitPriceVAT,
+        entry.currency,
+        entry.consumption || 0,
+        entry.consumptionUnit,
+      ]
+    );
+    if (values.length > 0) {
+      SS.getSheets()[i].getRange(2, 1, values.length, 8).setValues(values );
+    }
+  }
+}
+function populateSheetEffects() {
+  var yearEnd = END_DATE.toString().substring(0, 4);
+  var yearStart = START_DATE.toString().substring(0, 4);
+
+  for (var home = 1; home <= NUMBER_OF_HOMES; home++) {
+    var obj = createConsumptionJSON(home - 1);
+    var row = 4;
+    const sheet = SS.getSheets()[home];
+
+    for (var year = yearStart; year <= yearEnd; year++) {
+      sheet.getRange(row, 9).setValue(year);
+      for (var month = 1; month <= 12; month++) {
+        var y = String(year);
+        var m = month < 10 ? "0" + String(month) : String(month);
+
+        if (y in obj && m in obj[y]) {
+          var hold = obj[y][m];
+          var consumption = hold.reduce((partialSum, a) => partialSum + a, 0);
+          var effects = effectBand(hold);
+
+          sheet.getRange(row, 10).setValue(m);
+          sheet.getRange(row, 11).setValue(consumption);
+          sheet.getRange(row, 12, 1, effects.length).setValues([effects]);
+
+          row++;
+        }
+      }
+    }
+  }
+}
+
+/* ------------------- run function -------------------*/
+
+function run() {
+  clearSheets();
+  buildSheets();
+  
+  populateSheetsConsumption();
+  populateSheetEffects();
+  
+  setHeaderConsumption();
+  setHeaderEffect();
+  setDsoInfo();
+}
